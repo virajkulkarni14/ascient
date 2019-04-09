@@ -11,23 +11,36 @@ import io.ktor.features.ContentNegotiation
 import io.ktor.features.DefaultHeaders
 import io.ktor.features.StatusPages
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.cio.websocket.*
 import io.ktor.jackson.jackson
 import io.ktor.response.respond
 import io.ktor.routing.route
 import io.ktor.routing.routing
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.netty.Netty
+import io.ktor.websocket.WebSockets
+import io.ktor.websocket.webSocket
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.ObsoleteCoroutinesApi
+import kotlinx.coroutines.channels.consumeEach
+import kotlinx.coroutines.channels.mapNotNull
+import kotlinx.coroutines.launch
 import mu.KotlinLogging
 import org.flywaydb.core.Flyway
 import org.flywaydb.core.internal.exception.FlywaySqlException
 import org.jetbrains.exposed.sql.Database
 import java.io.EOFException
 import java.net.ConnectException
+import java.time.Duration
 import java.util.*
 import kotlin.concurrent.schedule
 
+data class AscientWebsocketSession(val webSocketSession: WebSocketSession, val callback: suspend () -> Unit)
+
 val sessions = AscientSessions(Environment.sessionLength)
 val logger = KotlinLogging.logger {}
+
+val activeWebSockets = mutableListOf<AscientWebsocketSession>()
 
 fun main() {
     while (true) {
@@ -64,6 +77,17 @@ fun main() {
         sessions.purge()
     }
 
+    Timer().schedule(
+            3000, 3000
+    ) {
+        logger.info("active web sockets: {}", activeWebSockets.size)
+        activeWebSockets.forEach {
+            GlobalScope.launch {
+                it.callback()
+            }
+        }
+    }
+
     embeddedServer(
             Netty,
             port = Environment.databasePort
@@ -72,6 +96,7 @@ fun main() {
     }.start(wait = true)
 }
 
+@ObsoleteCoroutinesApi
 fun Application.server() {
     val log = KotlinLogging.logger {}
 
@@ -82,6 +107,11 @@ fun Application.server() {
             registerModule(JodaModule())
             configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false)
         }
+    }
+
+    install(WebSockets) {
+        pingPeriod = Duration.ofSeconds(10)
+        timeout = Duration.ofSeconds(15)
     }
 
     install(Authentication) {
@@ -114,8 +144,27 @@ fun Application.server() {
         }
     }
 
+    log.info("Starting...")
     routing {
         route("/api") {
+            webSocket("/websocket") {
+                log.info("New websocket")
+                val sendit = suspend {
+                    outgoing.send(Frame.Text("ping"))
+                }
+                val thing = AscientWebsocketSession(this, sendit)
+                activeWebSockets.add(thing)
+                incoming.mapNotNull { it as? Frame.Text }.consumeEach { frame ->
+                    val text = frame.readText()
+                    log.info("Websocket: $text")
+                    outgoing.send(Frame.Text("YOU SAID: $text"))
+                    if (text.trim().equals("bye", ignoreCase = true)) {
+                        log.info("Closing websocket...")
+                        close(CloseReason(CloseReason.Codes.NORMAL, "Client said BYE"))
+                    }
+                }
+                activeWebSockets.remove(thing)
+            }
             userRoutes()
             booleanRoutes()
         }
